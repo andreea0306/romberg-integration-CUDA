@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <chrono>
+#include <omp.h>
 //#include "utils.h"
 
 // cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
@@ -32,14 +33,14 @@ __device__ double evaluate_function(double x, int func_id) {
     }
 }
 
-/**
- * This kernel is the function f(x) = 1 / x
- * for the given element
+/*
+ * CUDA kernel to compute function values for an array of inputs
  */
 __global__ void f_function(const double* x, int* errorFlag, double* result, const int n, const int func_id) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < n) {
         if (x[i] == 0) {
+         	// Set error flag if input is zero (avoiding division by zero)
             *errorFlag = 1;
             //printf("NOK \n"); //debug
         } else {
@@ -48,6 +49,9 @@ __global__ void f_function(const double* x, int* errorFlag, double* result, cons
     }
 }
 
+/*
+ * CUDA kernel to perform block-wise reduction (sum) of an array
+ */
 __global__ void reduceSum(const double* f_values, double* partial_sums, const int n) {
     extern __shared__ double shared_mem[];
     int tid = threadIdx.x;
@@ -71,134 +75,111 @@ __global__ void reduceSum(const double* f_values, double* partial_sums, const in
     }
 }
 
-
-/**
- * Function for safe compute -> to catch if it is devided to 0
+/*
+ * Host function to safely launch the CUDA kernel and handle memory transfers
  */
 void safeCompute(double* host_x, double* host_result, int n, int func_id, cudaStream_t stream) {
     double* device_x = nullptr;
     double* device_result = nullptr;
     int* device_errorFlag = nullptr;
-
     int host_errorFlag = 0;
 
+	// Allocate device memory
     cudaMalloc((void**)&device_x, n * sizeof(double));
     cudaMalloc((void**)&device_result, n * sizeof(double));
     cudaMalloc((void**)&device_errorFlag, sizeof(int));
 
-    // Initialize errorFlag to 0
-    cudaMemcpy(device_errorFlag, &host_errorFlag, sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(device_x, host_x, n * sizeof(double), cudaMemcpyHostToDevice);
+    // Initialize errorFlag to 0 and perform async memory transfers
+    cudaMemcpyAsync(device_errorFlag, &host_errorFlag, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(device_x, host_x, n * sizeof(double), cudaMemcpyHostToDevice, stream);
 
-    int threadsPerBlock = 256;
+    // Launch kernel
+    int threadsPerBlock = 128;
     int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
 
-    f_function<<<blocksPerGrid, threadsPerBlock>>>(device_x, device_errorFlag, device_result, n, func_id);
-    cudaDeviceSynchronize(); // Ensure kernel execution is complete
+    // Launch kernel in the given stream
+    f_function<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(device_x, device_errorFlag, device_result, n, func_id);
 
-    cudaMemcpy(host_result, device_result, n * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&host_errorFlag, device_errorFlag, sizeof(int), cudaMemcpyDeviceToHost);
+    // Perform async memory transfers back to host (copy results back to host)
+    cudaMemcpyAsync(host_result, device_result, n * sizeof(double), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(&host_errorFlag, device_errorFlag, sizeof(int), cudaMemcpyDeviceToHost, stream);
 
+    // Check for errors after stream synchronization
+//    cudaStreamSynchronize(stream);
     if (host_errorFlag != 0) {
         std::cerr << "[ERROR] Division by zero detected in kernel! \n";
     }
 
+    // Free device memory
     cudaFree(device_x);
     cudaFree(device_result);
     cudaFree(device_errorFlag);
 }
+
 /*
-double parallelSum(double* device_values, int n) {
-    const int threadsPerBlock = 256;
+ * Recursive parallel reduction to compute the sum of an array
+ */
+double parallelSum(double* device_values, int n, cudaStream_t stream) {
+    const int threadsPerBlock = 512;
     int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
     size_t shared_mem_size = threadsPerBlock * sizeof(double);
 
     double* device_partial_sums = nullptr;
     cudaMalloc(&device_partial_sums, blocksPerGrid * sizeof(double));
 
-    reduceSum<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(device_values, device_partial_sums, n);
-
-    double* host_partial_sums = new double[blocksPerGrid];
-    cudaMemcpy(host_partial_sums, device_partial_sums, blocksPerGrid * sizeof(double), cudaMemcpyDeviceToHost);
-
-    double total_sum = 0.0;
-    for (int i = 0; i < blocksPerGrid; i++) {
-        total_sum += host_partial_sums[i];
-    }
-
-    delete[] host_partial_sums;
-    cudaFree(device_partial_sums);
-    return total_sum;
-}
-*/
-double parallelSum(double* device_values, int n) {
-    const int threadsPerBlock = 512;  // Increase threads per block if appropriate
-    int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-    size_t shared_mem_size = threadsPerBlock * sizeof(double);
-
-    double* device_partial_sums = nullptr;
-    cudaMalloc(&device_partial_sums, blocksPerGrid * sizeof(double));
-
-    // Perform reduction in parallel
-    reduceSum<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(device_values, device_partial_sums, n);
-    cudaDeviceSynchronize();  // Ensure kernel execution is complete
-
-    // Use a single kernel to perform the final reduction step
+     // Perform reductions iteratively until one value remains
+    reduceSum<<<blocksPerGrid, threadsPerBlock, shared_mem_size, stream>>>(device_values, device_partial_sums, n);
     while (blocksPerGrid > 1) {
+      	printf("blocksPerGrid: %d\n", blocksPerGrid);
         int new_blocksPerGrid = (blocksPerGrid + threadsPerBlock - 1) / threadsPerBlock;
-        reduceSum<<<new_blocksPerGrid, threadsPerBlock, shared_mem_size>>>(device_partial_sums, device_partial_sums, blocksPerGrid);
+        reduceSum<<<new_blocksPerGrid, threadsPerBlock, shared_mem_size, stream>>>(device_partial_sums, device_partial_sums, blocksPerGrid);
         blocksPerGrid = new_blocksPerGrid;
-        cudaDeviceSynchronize();  // Ensure each reduction step is complete
     }
 
-    // The final result is now in device_partial_sums[0]
-    double result;
-    cudaMemcpy(&result, device_partial_sums, sizeof(double), cudaMemcpyDeviceToHost);
+    double result = 0.0;
+    cudaMemcpyAsync(&result, device_partial_sums, sizeof(double), cudaMemcpyDeviceToHost, stream);
 
     cudaFree(device_partial_sums);
+//    cudaStreamSynchronize(stream); // Wait for all operations in the stream to complete
     return result;
 }
 
-
+/*
+ * Host function to perform Romberg integration using CUDA streams
+ */
 void romberg_integration(double lower_limit, double upper_limit, uint32_t p, uint32_t q, int func_id, cudaStream_t stream) {
-    
-    if(lower_limit == 0 || upper_limit == 0) {
-        std::cerr<<"[ERROR]: Division by zero detected! \n";
+    if (lower_limit == 0 || upper_limit == 0) {
+        std::cerr << "[ERROR]: Division by zero detected!\n";
         return;
     }
+
     const int maxSize = 1001;
     double t[maxSize][maxSize] = {0};
     double h = upper_limit - lower_limit;
-    
 
     t[0][0] = h / 2.0 * (1.0 / lower_limit + 1.0 / upper_limit);
 
     for (uint32_t i = 1; i <= p; i++) {
         uint32_t sl = static_cast<uint32_t>(pow(2, i - 1));
         double h_i = h / pow(2, i);
-        double* x_points = new double[sl];
-        double* f_values = new double[sl];
+
+        double* host_x_points = new double[sl];
+        double* host_f_values = new double[sl];
 
         for (uint32_t k = 1; k <= sl; k++) {
-            x_points[k - 1] = lower_limit + (2 * k - 1) * h_i;
+            host_x_points[k - 1] = lower_limit + (2 * k - 1) * h_i;
         }
 
-        double* device_x_points = nullptr;
+        safeCompute(host_x_points, host_f_values, sl, func_id, stream);
+
         double* device_f_values = nullptr;
-
-        cudaMalloc(&device_x_points, sl * sizeof(double));
         cudaMalloc(&device_f_values, sl * sizeof(double));
+        cudaMemcpyAsync(device_f_values, host_f_values, sl * sizeof(double), cudaMemcpyHostToDevice, stream);
 
-        cudaMemcpy(device_x_points, x_points, sl * sizeof(double), cudaMemcpyHostToDevice);
-        
-        safeCompute(x_points, f_values, sl, func_id, stream);
+        double sm = parallelSum(device_f_values, sl, stream);
 
-        cudaMemcpy(device_f_values, f_values, sl * sizeof(double), cudaMemcpyHostToDevice);
-        double sm = parallelSum(device_f_values, sl);
-
-        delete[] x_points;
-        delete[] f_values;
-        cudaFree(device_x_points);
+        delete[] host_x_points;
+        delete[] host_f_values;
         cudaFree(device_f_values);
 
         t[i][0] = t[i - 1][0] / 2.0 + sm * h_i;
@@ -214,39 +195,83 @@ void romberg_integration(double lower_limit, double upper_limit, uint32_t p, uin
     std::cout << "Romberg estimate of integration = " << t[p][q] << std::endl;
 }
 
+
 int main() {
     double lower_limit = -10.0;
     double upper_limit = 11.0;
-    uint32_t p = 10;
-    uint32_t q = 10;
+    uint32_t p = 27;
+    uint32_t q = 27;
+
     int deviceCount;
     cudaGetDeviceCount(&deviceCount);
 
+    // Debug purpose 
     if (deviceCount == 0) {
         std::cout << "No CUDA-compatible GPU detected!" << std::endl;
         return 1;
     }
 
+    // Debug purpose
     for (int i = 0; i < deviceCount; ++i) {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, i);
         std::cout << "GPU Device " << i << ": " << prop.name << std::endl;
         std::cout << "Compute capability: " << prop.major << "." << prop.minor << std::endl;
+        if (prop.concurrentKernels) {
+            std::cout << "Device supports concurrent kernel execution.\n";
+        } else {
+            std::cout << "Device does not support concurrent kernel execution.\n";
+        }
     }
-    int num_functions = 20;
-    cudaStream_t streams[num_functions];
-    
-    auto start = std::chrono::high_resolution_clock::now();
-    for(int i=0; i<num_functions; i++) {
-        cudaStreamCreate(&streams[i]);
-        std::cout << "Integrating f" << i << "\n";
-        romberg_integration(lower_limit, upper_limit, p, q, i+1, streams[i]);
-    }
-    auto end = std::chrono::high_resolution_clock::now();
 
+    const int num_functions = 20;
+    cudaStream_t streams[num_functions];
+    cudaEvent_t startEvents[num_functions], endEvents[num_functions];
+
+    // Create CUDA streams and events
+    for (int i = 0; i < num_functions; ++i) {
+        cudaStreamCreate(&streams[i]);
+        cudaEventCreate(&startEvents[i]);
+        cudaEventCreate(&endEvents[i]);
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Launch integration tasks in parallel using streams
+    for (int i = 0; i < num_functions; ++i) {
+        // Record start of stream execution
+        cudaEventRecord(startEvents[i], streams[i]);
+        std::cout << "Integrating f" << (i + 1) << " in stream " << i << "\n";
+        romberg_integration(lower_limit, upper_limit, p, q, i + 1, streams[i]);
+        // Record end of stream execution
+        cudaEventRecord(endEvents[i], streams[i]);
+    }
+
+    // Synchronize all streams to ensure tasks are complete
+    for (int i = 0; i < num_functions; ++i) {
+        cudaStreamSynchronize(streams[i]);
+    }
+    float f = 0.0;
+    // Measure elapsed time for each stream and check overlap
+    for (int i = 0; i < num_functions; ++i) {
+        float elapsedTime = 0.0f;
+        cudaEventElapsedTime(&elapsedTime, startEvents[i], endEvents[i]);
+        std::cout << "Stream " << i << " execution time: " << elapsedTime << " ms\n";
+        f += elapsedTime;
+    }
+    std::cout << "total time:" << f << std::endl;
+
+    // Cleanup
+    for (int i = 0; i < num_functions; ++i) {
+        cudaStreamDestroy(streams[i]);
+        cudaEventDestroy(startEvents[i]);
+        cudaEventDestroy(endEvents[i]);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
     std::cout << "\nExecution time: " << duration << " seconds\n";
+
     return 0;
 }
-
 
